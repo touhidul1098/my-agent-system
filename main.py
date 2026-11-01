@@ -12,36 +12,61 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY.strip())
 
-# স্বয়ংক্রিয়ভাবে সক্রিয় ফ্রি Flash মডেল নির্বাচন
-def resolve_best_free_model():
+# গ্লোবাল ভেরিয়েবল যা সফল মডেলটি ধরে রাখবে
+WORKING_MODEL_NAME = None
+
+def find_working_free_model() -> str:
+    global WORKING_MODEL_NAME
+    if WORKING_MODEL_NAME:
+        return WORKING_MODEL_NAME
+
     if not GEMINI_API_KEY:
-        return None
+        raise RuntimeError("GEMINI_API_KEY পাওয়া যায়নি! Render Environment Variables চেক করুন।")
+
+    # generateContent সমর্থনকারী মডেলের তালিকা সংগ্রহ
     try:
-        available_models = [
+        all_models = [
             m.name for m in genai.list_models()
             if 'generateContent' in m.supported_generation_methods
         ]
-        # প্রো ও আল্ট্রা বাদ দিয়ে শুধু ফ্রি ফ্ল্যাশ মডেলগুলো ফিল্টার করা
-        flash_models = [
-            m for m in available_models 
-            if 'flash' in m.lower() and 'pro' not in m.lower()
-        ]
-        if flash_models:
-            # সবচেয়ে লেটেস্ট ফ্ল্যাশ মডেলটি নেওয়া (যেমন: 2.0-flash / 2.5-flash)
-            chosen = sorted(flash_models, reverse=True)[0]
-            print(f"--> Using Free Active Model: {chosen}")
-            return genai.GenerativeModel(chosen)
-        
-        # কোনো ফ্ল্যাশ নাম না পেলে generateContent সাপোর্ট করা প্রথম মডেল নেওয়া
-        if available_models:
-            return genai.GenerativeModel(available_models[0])
     except Exception as e:
-        print(f"Error fetching model list: {e}")
-    
-    # ডিফল্ট নিরাপদ ফলব্যাক
-    return genai.GenerativeModel("gemini-2.0-flash")
+        raise RuntimeError(f"গুগল এপিআই তালিকা লোড করতে ব্যর্থ: {str(e)}")
 
-model = resolve_best_free_model()
+    # বিলিং বা পেইড মডেলগুলো বাদ দেওয়া (omni, pro, ultra)
+    safe_candidates = [
+        m for m in all_models
+        if not any(blocked in m.lower() for blocked in ['omni', 'pro', 'ultra', 'preview-02'])
+    ]
+
+    # ফ্রি ফ্ল্যাশ ও লাইট মডেলগুলোকে অগ্রাধিকার দেওয়া
+    priority_order = ['2.5-flash', '2.0-flash', 'flash-lite', '1.5-flash-8b', 'flash']
+    sorted_candidates = []
+    
+    for p in priority_order:
+        for m in safe_candidates:
+            if p in m.lower() and m not in sorted_candidates:
+                sorted_candidates.append(m)
+
+    # বাকি সব নিরাপদ মডেল যুক্ত করা
+    for m in safe_candidates:
+        if m not in sorted_candidates:
+            sorted_candidates.append(m)
+
+    # একের পর এক টেস্ট করে ফ্রি কোটা সচল থাকা প্রথম মডেলটি লক করা
+    last_err = ""
+    for model_name in sorted_candidates:
+        try:
+            test_m = genai.GenerativeModel(model_name)
+            res = test_m.generate_content("hi")
+            if res and res.text:
+                WORKING_MODEL_NAME = model_name
+                print(f"[SUCCESS] Free active model locked: {WORKING_MODEL_NAME}")
+                return WORKING_MODEL_NAME
+        except Exception as err:
+            last_err = str(err)
+            continue
+
+    raise RuntimeError(f"কোনো ফ্রি মডেল পাওয়া যায়নি। সর্বশেষ ত্রুটি: {last_err}")
 
 class Message(BaseModel):
     role: str
@@ -53,21 +78,15 @@ class ChatPayload(BaseModel):
 
 @app.get("/ping")
 def ping():
-    return {"status": "alive"}
+    return {"status": "alive", "active_model": WORKING_MODEL_NAME or "standby"}
 
 async def run_agent(role_instruction: str, context: str, user_input: str) -> str:
-    global model
-    if not GEMINI_API_KEY:
-        raise HTTPException(
-            status_code=500, 
-            detail="Render Environment Variables-এ GEMINI_API_KEY পাওয়া যায়নি!"
-        )
-    if not model:
-        model = resolve_best_free_model()
+    loop = asyncio.get_event_loop()
+    # সচল মডেল খুঁজে নেওয়া
+    active_model_name = await loop.run_in_executor(None, find_working_free_model)
+    model = genai.GenerativeModel(active_model_name)
 
     prompt = f"SYSTEM ROLE: {role_instruction}\n\nCONVERSATION CONTEXT:\n{context}\n\nCURRENT TASK:\n{user_input}"
-    loop = asyncio.get_event_loop()
-    
     response = await loop.run_in_executor(None, model.generate_content, prompt)
     return response.text
 
@@ -110,6 +129,7 @@ async def chat_multi_agent(payload: ChatPayload):
         )
 
         return {
+            "model_used": WORKING_MODEL_NAME,
             "agent_1": a1_plan,
             "agent_2": a2_build,
             "agent_3": a3_critic,
@@ -149,7 +169,8 @@ def serve_ui():
             .user-msg { font-size: 1rem; font-weight: 600; color: #f0f6fc; margin-bottom: 15px; border-left: 3px solid var(--highlight); padding-left: 10px; }
             
             .final-card { background: #0d1117; border: 1px solid #238636; border-radius: 8px; padding: 18px; margin-bottom: 15px; }
-            .final-title { font-size: 1rem; font-weight: 700; color: #7ee787; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+            .final-title { font-size: 1rem; font-weight: 700; color: #7ee787; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; }
+            .model-badge { font-size: 0.75rem; background: #21262d; padding: 2px 8px; border-radius: 10px; color: #8b949e; font-weight: normal; }
             .output-text { white-space: pre-wrap; word-break: break-word; font-size: 0.95rem; line-height: 1.6; color: #f0f6fc; }
 
             .agent-tray { display: flex; flex-direction: column; gap: 8px; }
@@ -201,7 +222,7 @@ def serve_ui():
                 const submitBtn = document.getElementById('submitBtn');
                 const status = document.getElementById('status');
                 submitBtn.disabled = true;
-                status.innerText = "৫টি এজেন্ট ক্রমান্বয়ে কাজ করছে...";
+                status.innerText = "৫টি এজেন্ট ক্রমান্বয়ে সমাধান প্রস্তুত করছে...";
 
                 try {
                     const res = await fetch('/api/chat', {
@@ -236,7 +257,8 @@ def serve_ui():
                     
                     <div class="final-card">
                         <div class="final-title">
-                            ✓ Agent 5: Verified & Structured Output
+                            <span>✓ Agent 5: Verified & Structured Output</span>
+                            <span class="model-badge">${escapeHtml(data.model_used || 'Active')}</span>
                         </div>
                         <div class="output-text">${escapeHtml(data.final_output)}</div>
                     </div>
