@@ -8,13 +8,40 @@ import google.generativeai as genai
 
 app = FastAPI()
 
-# Render Environment Variables থেকে API Key রিড
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY.strip())
 
-# সরাসরি ফ্রি টিয়ার সাপোর্টেড Flash মডেল ফিক্স করা হলো (যা জিরো-কোটা এরর দেবে না)
-model = genai.GenerativeModel("gemini-2.5-flash")
+# স্বয়ংক্রিয়ভাবে সক্রিয় ফ্রি Flash মডেল নির্বাচন
+def resolve_best_free_model():
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        available_models = [
+            m.name for m in genai.list_models()
+            if 'generateContent' in m.supported_generation_methods
+        ]
+        # প্রো ও আল্ট্রা বাদ দিয়ে শুধু ফ্রি ফ্ল্যাশ মডেলগুলো ফিল্টার করা
+        flash_models = [
+            m for m in available_models 
+            if 'flash' in m.lower() and 'pro' not in m.lower()
+        ]
+        if flash_models:
+            # সবচেয়ে লেটেস্ট ফ্ল্যাশ মডেলটি নেওয়া (যেমন: 2.0-flash / 2.5-flash)
+            chosen = sorted(flash_models, reverse=True)[0]
+            print(f"--> Using Free Active Model: {chosen}")
+            return genai.GenerativeModel(chosen)
+        
+        # কোনো ফ্ল্যাশ নাম না পেলে generateContent সাপোর্ট করা প্রথম মডেল নেওয়া
+        if available_models:
+            return genai.GenerativeModel(available_models[0])
+    except Exception as e:
+        print(f"Error fetching model list: {e}")
+    
+    # ডিফল্ট নিরাপদ ফলব্যাক
+    return genai.GenerativeModel("gemini-2.0-flash")
+
+model = resolve_best_free_model()
 
 class Message(BaseModel):
     role: str
@@ -29,24 +56,20 @@ def ping():
     return {"status": "alive"}
 
 async def run_agent(role_instruction: str, context: str, user_input: str) -> str:
+    global model
     if not GEMINI_API_KEY:
         raise HTTPException(
             status_code=500, 
             detail="Render Environment Variables-এ GEMINI_API_KEY পাওয়া যায়নি!"
         )
+    if not model:
+        model = resolve_best_free_model()
 
     prompt = f"SYSTEM ROLE: {role_instruction}\n\nCONVERSATION CONTEXT:\n{context}\n\nCURRENT TASK:\n{user_input}"
     loop = asyncio.get_event_loop()
     
-    # এরর হ্যান্ডলিং ও ব্যাকআপ ট্রাই
-    try:
-        response = await loop.run_in_executor(None, model.generate_content, prompt)
-        return response.text
-    except Exception as e:
-        # যদি 2.5-flash কোনো কারণে ফেল করে, তাৎক্ষণিক 1.5-flash দিয়ে ট্রাই করবে
-        fallback_model = genai.GenerativeModel("gemini-1.5-flash")
-        response = await loop.run_in_executor(None, fallback_model.generate_content, prompt)
-        return response.text
+    response = await loop.run_in_executor(None, model.generate_content, prompt)
+    return response.text
 
 @app.post("/api/chat")
 async def chat_multi_agent(payload: ChatPayload):
