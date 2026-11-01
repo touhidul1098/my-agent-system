@@ -8,33 +8,13 @@ import google.generativeai as genai
 
 app = FastAPI()
 
-# Render Environment Variables চেক
+# Render Environment Variables থেকে API Key রিড
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-def get_active_model():
-    if not GEMINI_API_KEY:
-        return None
+if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY.strip())
-    
-    # অ্যাকাউন্টের অ্যাক্টিভ মডেল স্বয়ংক্রিয়ভাবে খুঁজে নেওয়া
-    try:
-        supported_models = [
-            m.name for m in genai.list_models() 
-            if 'generateContent' in m.supported_generation_methods
-        ]
-        # পছন্দের ক্রমানুসারে মডেল চেক করা
-        for preferred in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]:
-            for m in supported_models:
-                if preferred in m:
-                    return genai.GenerativeModel(m)
-        # না পেলে প্রথম সক্রিয় মডেলটি নেওয়া
-        if supported_models:
-            return genai.GenerativeModel(supported_models[0])
-    except Exception:
-        pass
-    return genai.GenerativeModel("gemini-1.5-flash")
 
-model = get_active_model()
+# সরাসরি ফ্রি টিয়ার সাপোর্টেড Flash মডেল ফিক্স করা হলো (যা জিরো-কোটা এরর দেবে না)
+model = genai.GenerativeModel("gemini-2.5-flash")
 
 class Message(BaseModel):
     role: str
@@ -49,19 +29,24 @@ def ping():
     return {"status": "alive"}
 
 async def run_agent(role_instruction: str, context: str, user_input: str) -> str:
-    global model
     if not GEMINI_API_KEY:
         raise HTTPException(
             status_code=500, 
-            detail="Render Environment Variables-এ GEMINI_API_KEY পাওয়া যায়নি! Render ড্যাশবোর্ডে গিয়ে এটি যুক্ত করুন।"
+            detail="Render Environment Variables-এ GEMINI_API_KEY পাওয়া যায়নি!"
         )
-    if not model:
-        model = get_active_model()
 
     prompt = f"SYSTEM ROLE: {role_instruction}\n\nCONVERSATION CONTEXT:\n{context}\n\nCURRENT TASK:\n{user_input}"
     loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(None, model.generate_content, prompt)
-    return response.text
+    
+    # এরর হ্যান্ডলিং ও ব্যাকআপ ট্রাই
+    try:
+        response = await loop.run_in_executor(None, model.generate_content, prompt)
+        return response.text
+    except Exception as e:
+        # যদি 2.5-flash কোনো কারণে ফেল করে, তাৎক্ষণিক 1.5-flash দিয়ে ট্রাই করবে
+        fallback_model = genai.GenerativeModel("gemini-1.5-flash")
+        response = await loop.run_in_executor(None, fallback_model.generate_content, prompt)
+        return response.text
 
 @app.post("/api/chat")
 async def chat_multi_agent(payload: ChatPayload):
@@ -71,26 +56,31 @@ async def chat_multi_agent(payload: ChatPayload):
     history_context = "\n".join([f"{m.role.upper()}: {m.content}" for m in payload.history[-6:]])
 
     try:
+        # এজেন্ট ১: Orchestrator
         a1_plan = await run_agent(
             "You are Agent 1 (Orchestrator). Break down the user problem into clear technical sub-goals.",
             history_context, payload.prompt
         )
 
+        # এজেন্ট ২: Architect & Builder
         a2_build = await run_agent(
             "You are Agent 2 (Builder/Coder). Generate the core structural logic, implementation, or solution based on Agent 1's plan.",
             history_context, a1_plan
         )
 
+        # এজেন্ট ৩: Critic & Security QA
         a3_critic = await run_agent(
             "You are Agent 3 (Critic/QA). Aggressively spot bugs, missing edge cases, security issues, or logical flaws in Agent 2's output.",
             history_context, a2_build
         )
 
+        # এজেন্ট ৪: Optimizer & Refiner
         a4_refine = await run_agent(
             "You are Agent 4 (Optimizer). Fix all issues found by Agent 3 and polish the implementation to production standard.",
             history_context, f"Code:\n{a2_build}\n\nCritique:\n{a3_critic}"
         )
 
+        # এজেন্ট ৫: Executive Presenter
         a5_final = await run_agent(
             "You are Agent 5 (Presenter). Prepare the final response for the user. Deliver an impeccably organized, crystal-clear deliverable. No robotic introductions.",
             history_context, a4_refine
