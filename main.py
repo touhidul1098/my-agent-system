@@ -8,12 +8,34 @@ import google.generativeai as genai
 
 app = FastAPI()
 
-# Render Environment Variables থেকে কী রিড করবে
+# Render Environment Variables চেক
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-#model = genai.GenerativeModel("gemini-1.5-flash")
-model = genai.GenerativeModel("gemini-1.5-flash-latest")
+
+def get_active_model():
+    if not GEMINI_API_KEY:
+        return None
+    genai.configure(api_key=GEMINI_API_KEY.strip())
+    
+    # অ্যাকাউন্টের অ্যাক্টিভ মডেল স্বয়ংক্রিয়ভাবে খুঁজে নেওয়া
+    try:
+        supported_models = [
+            m.name for m in genai.list_models() 
+            if 'generateContent' in m.supported_generation_methods
+        ]
+        # পছন্দের ক্রমানুসারে মডেল চেক করা
+        for preferred in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]:
+            for m in supported_models:
+                if preferred in m:
+                    return genai.GenerativeModel(m)
+        # না পেলে প্রথম সক্রিয় মডেলটি নেওয়া
+        if supported_models:
+            return genai.GenerativeModel(supported_models[0])
+    except Exception:
+        pass
+    return genai.GenerativeModel("gemini-1.5-flash")
+
+model = get_active_model()
+
 class Message(BaseModel):
     role: str
     content: str
@@ -22,12 +44,20 @@ class ChatPayload(BaseModel):
     prompt: str
     history: List[Message] = []
 
-# UptimeRobot হেলথ চেক রুট
 @app.get("/ping")
 def ping():
     return {"status": "alive"}
 
 async def run_agent(role_instruction: str, context: str, user_input: str) -> str:
+    global model
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=500, 
+            detail="Render Environment Variables-এ GEMINI_API_KEY পাওয়া যায়নি! Render ড্যাশবোর্ডে গিয়ে এটি যুক্ত করুন।"
+        )
+    if not model:
+        model = get_active_model()
+
     prompt = f"SYSTEM ROLE: {role_instruction}\n\nCONVERSATION CONTEXT:\n{context}\n\nCURRENT TASK:\n{user_input}"
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(None, model.generate_content, prompt)
@@ -84,7 +114,7 @@ def serve_ui():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Autonomous 5-Agent Hub</title>
+        <title>Autonomous 5-Agent Workspace</title>
         <style>
             :root {
                 --bg: #0d1117;
