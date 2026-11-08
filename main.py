@@ -13,7 +13,7 @@ client = Groq(api_key=GROQ_API_KEY.strip()) if GROQ_API_KEY else None
 WORKING_MODELS: List[str] = []
 
 def discover_working_models(target_count: int = 5) -> List[str]:
-    """Groq API থেকে মডেল সংগ্রহ ও যাচাই (একবারই চলবে স্টার্টআপে)"""
+    """Groq API থেকে মডেল সংগ্রহ ও যাচাই"""
     global WORKING_MODELS
     if len(WORKING_MODELS) >= target_count:
         return WORKING_MODELS
@@ -92,12 +92,16 @@ def ping():
         "assigned_models": WORKING_MODELS if len(WORKING_MODELS) == 5 else "Loading..."
     }
 
-async def run_agent(role_instruction: str, context: str, user_input: str, model_name: str, max_tokens: int = 500) -> str:
+async def run_agent(role_instruction: str, context: str, user_input: str, model_name: str, max_tokens: int = 400) -> str:
     loop = asyncio.get_event_loop()
     
+    # কনটেক্সট অতিরিক্ত বড় হলে ট্রাঙ্কেট করে দেওয়া যাতে context_length_exceeded না আসে
+    safe_context = context[-1200:] if len(context) > 1200 else context
+    safe_input = user_input[-2500:] if len(user_input) > 2500 else user_input
+
     messages = [
-        {"role": "system", "content": f"{role_instruction}\n\nCONTEXT:\n{context}"},
-        {"role": "user", "content": user_input}
+        {"role": "system", "content": f"{role_instruction}\n\nCONTEXT:\n{safe_context}"},
+        {"role": "user", "content": safe_input}
     ]
 
     def call_groq():
@@ -110,8 +114,9 @@ async def run_agent(role_instruction: str, context: str, user_input: str, model_
             )
             return response.choices[0].message.content
         except Exception as e:
-            if "429" in str(e) or "limit" in str(e).lower():
-                print(f"[FALLBACK] {model_name}-এ লিমিট হয়েছে, llama-3.1-8b-instant ব্যবহার করা হচ্ছে...")
+            # ফলব্যাক মডেল
+            if "429" in str(e) or "limit" in str(e).lower() or "context" in str(e).lower():
+                print(f"[FALLBACK] {model_name} ফেইল করেছে, llama-3.1-8b-instant ব্যবহার করা হচ্ছে...")
                 fallback = client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=messages,
@@ -129,39 +134,45 @@ async def chat_multi_agent(payload: ChatPayload):
         raise HTTPException(status_code=400, detail="প্রম্পট খালি রাখা যাবে না")
 
     models = discover_working_models()
-    history_context = "\n".join([f"{m.role.upper()}: {m.content}" for m in payload.history[-4:]])
+
+    # পূর্ববর্তী হিস্ট্রি সংক্ষিপ্ত করে নেওয়া (শুধু শেষ ২টি টার্ন এবং সংকুচিত টেক্সট)
+    shortened_history = []
+    for m in payload.history[-2:]:
+        trimmed_content = (m.content[:250] + "...") if len(m.content) > 250 else m.content
+        shortened_history.append(f"{m.role.upper()}: {trimmed_content}")
+    history_context = "\n".join(shortened_history)
 
     try:
-        # এজেন্ট ১: Orchestrator (পরিকল্পনা)
+        # এজেন্ট ১: Orchestrator (সংক্ষিপ্ত সাব-গোলস)
         a1_plan = await run_agent(
-            "You are Agent 1 (Orchestrator). Break down the user problem into clear technical sub-goals concisely.",
-            history_context, payload.prompt, models[0], max_tokens=500
+            "You are Agent 1 (Orchestrator). Output ONLY 3-4 bullet points of high-level requirements. Very concise.",
+            history_context, payload.prompt, models[0], max_tokens=300
         )
 
-        # এজেন্ট ২: Architect & Builder (প্রাথমিক লজিক/কোড ড্রাফট)
+        # এজেন্ট ২: Architect & Builder (সংক্ষিপ্ত কোর লজিক)
         a2_build = await run_agent(
-            "You are Agent 2 (Builder/Coder). Generate the core structural logic or working solution based on Agent 1's plan.",
-            history_context, a1_plan, models[1], max_tokens=700
+            "You are Agent 2 (Builder/Coder). Draft the essential code logic based on Agent 1. Avoid long comments.",
+            history_context, a1_plan, models[1], max_tokens=500
         )
 
-        # এজেন্ট ৩: Critic & Security QA (ভুল শনাক্তকরণ)
+        # এজেন্ট ৩: Critic & Security QA (সংক্ষিপ্ত রিভিউ)
         a3_critic = await run_agent(
-            "You are Agent 3 (Critic/QA). Aggressively spot bugs, missing edge cases, or syntax errors in Agent 2's output concisely.",
-            history_context, a2_build, models[2], max_tokens=500
+            "You are Agent 3 (Critic/QA). Identify top 2-3 syntax, logic, or edge case bugs. Be extremely concise.",
+            history_context, a2_build, models[2], max_tokens=300
         )
 
-        # এজেন্ট ৪: Optimizer (সংশোধন)
+        # এজেন্ট ৪: Optimizer (সংশোধিত সারাংশ)
         a4_refine = await run_agent(
-            "You are Agent 4 (Optimizer). Apply fixes for issues raised by Agent 3 and optimize the implementation.",
-            history_context, f"Code:\n{a2_build}\n\nCritique:\n{a3_critic}", models[3], max_tokens=700
+            "You are Agent 4 (Optimizer). Briefly list fixes to apply to Agent 2's code according to Agent 3.",
+            history_context, f"Code:\n{a2_build[:800]}\nCritique:\n{a3_critic}", models[3], max_tokens=400
         )
 
-        # এজেন্ট ৫: Executive Presenter (চূড়ান্ত সম্পূর্ণ ও কার্যকর আউটপুট)
+        # এজেন্ট ৫: Executive Presenter (সম্পূর্ণ কার্যকর আউটপুট)
         a5_final = await run_agent(
-            "You are Agent 5 (Presenter). Provide the COMPLETE, runnable, polished final code and implementation. "
-            "Do NOT output large ASCII architecture diagrams. Do NOT truncate or cut off code midway. "
-            "Deliver a complete working solution directly.",
-            history_context, a4_refine, models[4], max_tokens=1800
+            "You are Agent 5 (Presenter). Write the COMPLETE, runnable, working Python code. "
+            "Do NOT include ASCII diagrams. Do NOT cut off. Deliver the full solution.",
+            history_context, f"User Goal:\n{payload.prompt}\n\nDraft Plan:\n{a4_refine}\n\nBase Code:\n{a2_build}", 
+            models[4], max_tokens=1500
         )
 
         return {
@@ -283,8 +294,10 @@ def serve_ui():
 
                     if (!res.ok) throw new Error(data.detail || "Execution failed");
 
+                    // মেমোরি হালকা রাখতে লোকালস্টোরেজে সংক্ষিপ্ত হিস্ট্রি রাখা
                     chatHistory.push({ role: "user", content: prompt });
-                    chatHistory.push({ role: "assistant", content: data.final_output });
+                    chatHistory.push({ role: "assistant", content: data.final_output.slice(0, 300) });
+                    if (chatHistory.length > 6) chatHistory = chatHistory.slice(-6);
                     localStorage.setItem('agent_history', JSON.stringify(chatHistory));
 
                     renderTurn(prompt, data);
