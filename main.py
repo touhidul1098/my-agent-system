@@ -15,24 +15,25 @@ client = Groq(api_key=GROQ_API_KEY.strip()) if GROQ_API_KEY else None
 WORKING_MODELS: List[str] = []
 
 def discover_working_models(target_count: int = 5) -> List[str]:
-    """Groq API থেকে সক্রিয় চ্যাট মডেল সংগ্রহ করে টেস্ট করে প্রথম ৫টি সচল মডেল লক করে।"""
+    """Groq API থেকে সক্রিয় এবং নিরাপদ লিমিটের চ্যাট মডেল সংগ্রহ করে প্রথম ৫টি মডেল লক করে।"""
     global WORKING_MODELS
     if len(WORKING_MODELS) >= target_count:
         return WORKING_MODELS
 
     if not client:
-        raise RuntimeError("GROQ_API_KEY পাওয়া যায়নি! Environment Variables চেক করুন।")
+        raise RuntimeError("GROQ_API_KEY পাওয়া যায়নি! Render Environment Variables চেক করুন।")
 
-    # যেসব মডেল সাধারণ চ্যাট সমর্থন করে না (অডিও, গার্ড, ক্লাসিফিকেশন, এমবেডিং ইত্যাদি)
+    # যেসব মডেল সাধারণ চ্যাট সমর্থন করে না বা রেট লিমিট অত্যন্ত কম (OTPM < 1000)
     blocked_keywords = [
         "whisper", "tts", "audio", "embed", "guard", 
-        "classifier", "moderation", "safeguard", "vision"
+        "classifier", "moderation", "safeguard", "vision",
+        "qwen", "r1", "preview"
     ]
 
     try:
         models_data = client.models.list().data
         
-        # শুধুমাত্র টেক্সট জেনারেশন ও চ্যাট উপযোগী মডেল ফিল্টার করা
+        # শুধুমাত্র টেক্সট জেনারেশন ও স্থিতিশীল চ্যাট মডেল ফিল্টার করা
         available_ids = [
             m.id for m in models_data 
             if getattr(m, "active", True) and not any(blocked in m.id.lower() for blocked in blocked_keywords)
@@ -41,9 +42,8 @@ def discover_working_models(target_count: int = 5) -> List[str]:
         raise RuntimeError(f"Groq API থেকে মডেল তালিকা লোড করতে ব্যর্থ: {str(e)}")
 
     verified_models = []
-    print("[INFO] সচল চ্যাট মডেল টেস্ট ও ফিল্টারিং শুরু হচ্ছে...")
+    print("[INFO] সচল ও নিরাপদ লিমিটের চ্যাট মডেল টেস্ট করা হচ্ছে...")
 
-    # টেস্ট করার সময় সিস্টেম ও ইউজার উভয় মেসেজ দেওয়া হচ্ছে যেন ক্লাসিফিকেশন মডেল থাকলে সাথে সাথে ফিল্টার হয়
     test_messages = [
         {"role": "system", "content": "You are a test helper."},
         {"role": "user", "content": "hi"}
@@ -51,10 +51,11 @@ def discover_working_models(target_count: int = 5) -> List[str]:
 
     for model_id in available_ids:
         try:
+            # max_tokens নির্দিষ্ট করে দেওয়া হচ্ছে যাতে OTPM এরর না আসে
             res = client.chat.completions.create(
                 messages=test_messages,
                 model=model_id,
-                max_tokens=5
+                max_tokens=10
             )
             if res and res.choices:
                 verified_models.append(model_id)
@@ -62,19 +63,18 @@ def discover_working_models(target_count: int = 5) -> List[str]:
                 if len(verified_models) == target_count:
                     break
         except Exception as err:
-            # গার্ড মডেল বা টেমপ্লেট এরর দিলে স্বয়ংক্রিয়ভাবে বাদ যাবে
             print(f"[SKIPPED] {model_id} বাদ দেওয়া হয়েছে: {str(err)[:60]}...")
             continue
 
     if not verified_models:
-        raise RuntimeError("কোনো উপযোগী চ্যাট মডেল পাওয়া যায়নি।")
+        # কোনো কারণে তালিকা খালি হলে ডিফল্ট দ্রুতগতির ও নির্ভরযোগ্য ব্যাকআপ
+        verified_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
-    # ৫টির কম মডেল পাওয়া গেলে প্রাপ্ত সক্রিয় মডেলগুলো চক্রাকারে ব্যবহার করে ৫টি পূরণ করা
     while len(verified_models) < target_count:
         verified_models.append(verified_models[len(verified_models) % len(verified_models)])
 
     WORKING_MODELS = verified_models[:target_count]
-    print(f"[SUCCESS] ৫টি এজেন্টের জন্য নির্বাচিত চূড়ান্ত মডেলসমূহ: {WORKING_MODELS}")
+    print(f"[SUCCESS] ৫টি এজেন্টের জন্য নির্বাচিত মডেলসমূহ: {WORKING_MODELS}")
     return WORKING_MODELS
 
 class Message(BaseModel):
@@ -101,12 +101,26 @@ async def run_agent(role_instruction: str, context: str, user_input: str, model_
     ]
 
     def call_groq():
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            temperature=0.7
-        )
-        return response.choices[0].message.content
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=600  # Groq Free Tier এর সীমার ভেতর রাখা হয়েছে
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            # 429 রেট লিমিট বা টোকেন লিমিট এরর হলে নিরাপদ মডেল ব্যাকআপ হিসেবে কল হবে
+            if "429" in str(e) or "limit" in str(e).lower():
+                print(f"[FALLBACK] {model_name}-এ লিমিট হয়েছে, llama-3.1-8b-instant দিয়ে পুনরায় চেষ্টা করা হচ্ছে...")
+                fallback_response = client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=600
+                )
+                return fallback_response.choices[0].message.content
+            raise e
 
     return await loop.run_in_executor(None, call_groq)
 
@@ -116,39 +130,38 @@ async def chat_multi_agent(payload: ChatPayload):
         raise HTTPException(status_code=400, detail="প্রম্পট খালি রাখা যাবে না")
 
     loop = asyncio.get_event_loop()
-    # সচল চ্যাট মডেলসমূহ নিশ্চিত করা
     models = await loop.run_in_executor(None, discover_working_models)
 
-    history_context = "\n".join([f"{m.role.upper()}: {m.content}" for m in payload.history[-6:]])
+    history_context = "\n".join([f"{m.role.upper()}: {m.content}" for m in payload.history[-4:]])
 
     try:
         # এজেন্ট ১: Orchestrator
         a1_plan = await run_agent(
-            "You are Agent 1 (Orchestrator). Break down the user problem into clear technical sub-goals.",
+            "You are Agent 1 (Orchestrator). Break down the user problem into clear technical sub-goals concisely.",
             history_context, payload.prompt, models[0]
         )
 
         # এজেন্ট ২: Architect & Builder
         a2_build = await run_agent(
-            "You are Agent 2 (Builder/Coder). Generate the core structural logic, implementation, or solution based on Agent 1's plan.",
+            "You are Agent 2 (Builder/Coder). Generate the core structural logic or concise solution based on Agent 1's plan.",
             history_context, a1_plan, models[1]
         )
 
         # এজেন্ট ৩: Critic & Security QA
         a3_critic = await run_agent(
-            "You are Agent 3 (Critic/QA). Aggressively spot bugs, missing edge cases, security issues, or logical flaws in Agent 2's output.",
+            "You are Agent 3 (Critic/QA). Spot bugs, edge cases, security issues, or flaws in Agent 2's output.",
             history_context, a2_build, models[2]
         )
 
         # এজেন্ট ৪: Optimizer & Refiner
         a4_refine = await run_agent(
-            "You are Agent 4 (Optimizer). Fix all issues found by Agent 3 and polish the implementation to production standard.",
-            history_context, f"Code:\n{a2_build}\n\nCritique:\n{a3_critic}", models[3]
+            "You are Agent 4 (Optimizer). Fix issues spotted by Agent 3 and polish the deliverable.",
+            history_context, f"Draft:\n{a2_build}\n\nCritique:\n{a3_critic}", models[3]
         )
 
         # এজেন্ট ৫: Executive Presenter
         a5_final = await run_agent(
-            "You are Agent 5 (Presenter). Prepare the final response for the user. Deliver an impeccably organized, crystal-clear deliverable. No robotic introductions.",
+            "You are Agent 5 (Presenter). Prepare the final response for the user. Deliver a crystal-clear, structured deliverable without meta-commentary.",
             history_context, a4_refine, models[4]
         )
 
