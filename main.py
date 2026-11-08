@@ -4,13 +4,12 @@ from typing import List
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import google.generativeai as genai
+from groq import Groq
 
 app = FastAPI()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY.strip())
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+client = Groq(api_key=GROQ_API_KEY.strip()) if GROQ_API_KEY else None
 
 # গ্লোবাল ভেরিয়েবল যা সফল মডেলটি ধরে রাখবে
 WORKING_MODEL_NAME = None
@@ -20,53 +19,34 @@ def find_working_free_model() -> str:
     if WORKING_MODEL_NAME:
         return WORKING_MODEL_NAME
 
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY পাওয়া যায়নি! Render Environment Variables চেক করুন।")
+    if not client:
+        raise RuntimeError("GROQ_API_KEY পাওয়া যায়নি! Environment Variables চেক করুন।")
 
-    # generateContent সমর্থনকারী মডেলের তালিকা সংগ্রহ
-    try:
-        all_models = [
-            m.name for m in genai.list_models()
-            if 'generateContent' in m.supported_generation_methods
-        ]
-    except Exception as e:
-        raise RuntimeError(f"গুগল এপিআই তালিকা লোড করতে ব্যর্থ: {str(e)}")
-
-    # বিলিং বা পেইড মডেলগুলো বাদ দেওয়া (omni, pro, ultra)
-    safe_candidates = [
-        m for m in all_models
-        if not any(blocked in m.lower() for blocked in ['omni', 'pro', 'ultra', 'preview-02'])
+    # Groq-এর ফ্রি এবং জনপ্রিয় মডেলগুলোর অগ্রাধিকার তালিকা
+    priority_models = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "mixtral-8x7b-32768",
+        "gemma2-9b-it"
     ]
 
-    # ফ্রি ফ্ল্যাশ ও লাইট মডেলগুলোকে অগ্রাধিকার দেওয়া
-    priority_order = ['2.5-flash', '2.0-flash', 'flash-lite', '1.5-flash-8b', 'flash']
-    sorted_candidates = []
-    
-    for p in priority_order:
-        for m in safe_candidates:
-            if p in m.lower() and m not in sorted_candidates:
-                sorted_candidates.append(m)
-
-    # বাকি সব নিরাপদ মডেল যুক্ত করা
-    for m in safe_candidates:
-        if m not in sorted_candidates:
-            sorted_candidates.append(m)
-
-    # একের পর এক টেস্ট করে ফ্রি কোটা সচল থাকা প্রথম মডেলটি লক করা
     last_err = ""
-    for model_name in sorted_candidates:
+    for model_name in priority_models:
         try:
-            test_m = genai.GenerativeModel(model_name)
-            res = test_m.generate_content("hi")
-            if res and res.text:
+            res = client.chat.completions.create(
+                messages=[{"role": "user", "content": "hi"}],
+                model=model_name,
+                max_tokens=10
+            )
+            if res and res.choices:
                 WORKING_MODEL_NAME = model_name
-                print(f"[SUCCESS] Free active model locked: {WORKING_MODEL_NAME}")
+                print(f"[SUCCESS] Groq active model locked: {WORKING_MODEL_NAME}")
                 return WORKING_MODEL_NAME
         except Exception as err:
             last_err = str(err)
             continue
 
-    raise RuntimeError(f"কোনো ফ্রি মডেল পাওয়া যায়নি। সর্বশেষ ত্রুটি: {last_err}")
+    raise RuntimeError(f"কোনো সচল Groq মডেল পাওয়া যায়নি। সর্বশেষ ত্রুটি: {last_err}")
 
 class Message(BaseModel):
     role: str
@@ -82,13 +62,23 @@ def ping():
 
 async def run_agent(role_instruction: str, context: str, user_input: str) -> str:
     loop = asyncio.get_event_loop()
-    # সচল মডেল খুঁজে নেওয়া
     active_model_name = await loop.run_in_executor(None, find_working_free_model)
-    model = genai.GenerativeModel(active_model_name)
 
-    prompt = f"SYSTEM ROLE: {role_instruction}\n\nCONVERSATION CONTEXT:\n{context}\n\nCURRENT TASK:\n{user_input}"
-    response = await loop.run_in_executor(None, model.generate_content, prompt)
-    return response.text
+    messages = [
+        {"role": "system", "content": f"{role_instruction}\n\nCONTEXT:\n{context}"},
+        {"role": "user", "content": user_input}
+    ]
+
+    def call_groq():
+        response = client.chat.completions.create(
+            model=active_model_name,
+            messages=messages,
+            temperature=0.7
+        )
+        return response.choices[0].message.content
+
+    response_text = await loop.run_in_executor(None, call_groq)
+    return response_text
 
 @app.post("/api/chat")
 async def chat_multi_agent(payload: ChatPayload):
@@ -169,7 +159,7 @@ def serve_ui():
             .user-msg { font-size: 1rem; font-weight: 600; color: #f0f6fc; margin-bottom: 15px; border-left: 3px solid var(--highlight); padding-left: 10px; }
             
             .final-card { background: #0d1117; border: 1px solid #238636; border-radius: 8px; padding: 18px; margin-bottom: 15px; }
-            .final-title { font-size: 1rem; font-weight: 700; color: #7ee787; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; }
+            .final-title { font-size: 1rem; font-weight: 700; color: #7ee787; display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
             .model-badge { font-size: 0.75rem; background: #21262d; padding: 2px 8px; border-radius: 10px; color: #8b949e; font-weight: normal; }
             .output-text { white-space: pre-wrap; word-break: break-word; font-size: 0.95rem; line-height: 1.6; color: #f0f6fc; }
 
@@ -222,7 +212,7 @@ def serve_ui():
                 const submitBtn = document.getElementById('submitBtn');
                 const status = document.getElementById('status');
                 submitBtn.disabled = true;
-                status.innerText = "৫টি এজেন্ট ক্রমান্বয়ে সমাধান প্রস্তুত করছে...";
+                status.innerText = "৫টি এজেন্ট ক্রমান্বয়ে সমাধান প্রস্তুত করছে...";
 
                 try {
                     const res = await fetch('/api/chat', {
