@@ -69,7 +69,6 @@ def discover_working_models(target_count: int = 5) -> List[str]:
     print(f"[FINAL MODELS LOCKED] {WORKING_MODELS}")
     return WORKING_MODELS
 
-# সার্ভার স্টার্ট হওয়ার সাথে সাথে ব্যাকগ্রাউন্ডে মডেল রেডি করা
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     loop = asyncio.get_event_loop()
@@ -93,7 +92,7 @@ def ping():
         "assigned_models": WORKING_MODELS if len(WORKING_MODELS) == 5 else "Loading..."
     }
 
-async def run_agent(role_instruction: str, context: str, user_input: str, model_name: str) -> str:
+async def run_agent(role_instruction: str, context: str, user_input: str, model_name: str, max_tokens: int = 500) -> str:
     loop = asyncio.get_event_loop()
     
     messages = [
@@ -107,17 +106,17 @@ async def run_agent(role_instruction: str, context: str, user_input: str, model_
                 model=model_name,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=500
+                max_tokens=max_tokens
             )
             return response.choices[0].message.content
         except Exception as e:
             if "429" in str(e) or "limit" in str(e).lower():
-                # ফলব্যাক মডেল
+                print(f"[FALLBACK] {model_name}-এ লিমিট হয়েছে, llama-3.1-8b-instant ব্যবহার করা হচ্ছে...")
                 fallback = client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=messages,
                     temperature=0.7,
-                    max_tokens=500
+                    max_tokens=max_tokens
                 )
                 return fallback.choices[0].message.content
             raise e
@@ -133,29 +132,36 @@ async def chat_multi_agent(payload: ChatPayload):
     history_context = "\n".join([f"{m.role.upper()}: {m.content}" for m in payload.history[-4:]])
 
     try:
+        # এজেন্ট ১: Orchestrator (পরিকল্পনা)
         a1_plan = await run_agent(
             "You are Agent 1 (Orchestrator). Break down the user problem into clear technical sub-goals concisely.",
-            history_context, payload.prompt, models[0]
+            history_context, payload.prompt, models[0], max_tokens=500
         )
 
+        # এজেন্ট ২: Architect & Builder (প্রাথমিক লজিক/কোড ড্রাফট)
         a2_build = await run_agent(
-            "You are Agent 2 (Builder/Coder). Generate the core structural logic or concise solution based on Agent 1's plan.",
-            history_context, a1_plan, models[1]
+            "You are Agent 2 (Builder/Coder). Generate the core structural logic or working solution based on Agent 1's plan.",
+            history_context, a1_plan, models[1], max_tokens=700
         )
 
+        # এজেন্ট ৩: Critic & Security QA (ভুল শনাক্তকরণ)
         a3_critic = await run_agent(
-            "You are Agent 3 (Critic/QA). Spot bugs, edge cases, security issues, or flaws in Agent 2's output concisely.",
-            history_context, a2_build, models[2]
+            "You are Agent 3 (Critic/QA). Aggressively spot bugs, missing edge cases, or syntax errors in Agent 2's output concisely.",
+            history_context, a2_build, models[2], max_tokens=500
         )
 
+        # এজেন্ট ৪: Optimizer (সংশোধন)
         a4_refine = await run_agent(
-            "You are Agent 4 (Optimizer). Fix issues spotted by Agent 3 and polish the deliverable.",
-            history_context, f"Draft:\n{a2_build}\n\nCritique:\n{a3_critic}", models[3]
+            "You are Agent 4 (Optimizer). Apply fixes for issues raised by Agent 3 and optimize the implementation.",
+            history_context, f"Code:\n{a2_build}\n\nCritique:\n{a3_critic}", models[3], max_tokens=700
         )
 
+        # এজেন্ট ৫: Executive Presenter (চূড়ান্ত সম্পূর্ণ ও কার্যকর আউটপুট)
         a5_final = await run_agent(
-            "You are Agent 5 (Presenter). Prepare the final response for the user. Deliver an impeccably organized, crystal-clear deliverable without meta-commentary.",
-            history_context, a4_refine, models[4]
+            "You are Agent 5 (Presenter). Provide the COMPLETE, runnable, polished final code and implementation. "
+            "Do NOT output large ASCII architecture diagrams. Do NOT truncate or cut off code midway. "
+            "Deliver a complete working solution directly.",
+            history_context, a4_refine, models[4], max_tokens=1800
         )
 
         return {
