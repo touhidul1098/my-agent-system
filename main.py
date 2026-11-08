@@ -1,29 +1,27 @@
 import os
 import asyncio
 from typing import List
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from groq import Groq
 
-app = FastAPI()
-
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 client = Groq(api_key=GROQ_API_KEY.strip()) if GROQ_API_KEY else None
 
-# ৫টি এজেন্টের জন্য স্বয়ংক্রিয়ভাবে নির্বাচিত ৫টি সচল চ্যাট মডেলের তালিকা
 WORKING_MODELS: List[str] = []
 
 def discover_working_models(target_count: int = 5) -> List[str]:
-    """Groq API থেকে সক্রিয় এবং নিরাপদ লিমিটের চ্যাট মডেল সংগ্রহ করে প্রথম ৫টি মডেল লক করে।"""
+    """Groq API থেকে মডেল সংগ্রহ ও যাচাই (একবারই চলবে স্টার্টআপে)"""
     global WORKING_MODELS
     if len(WORKING_MODELS) >= target_count:
         return WORKING_MODELS
 
     if not client:
-        raise RuntimeError("GROQ_API_KEY পাওয়া যায়নি! Render Environment Variables চেক করুন।")
+        print("[ERROR] GROQ_API_KEY পাওয়া যায়নি!")
+        return ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
-    # যেসব মডেল সাধারণ চ্যাট সমর্থন করে না বা রেট লিমিট অত্যন্ত কম (OTPM < 1000)
     blocked_keywords = [
         "whisper", "tts", "audio", "embed", "guard", 
         "classifier", "moderation", "safeguard", "vision",
@@ -32,18 +30,15 @@ def discover_working_models(target_count: int = 5) -> List[str]:
 
     try:
         models_data = client.models.list().data
-        
-        # শুধুমাত্র টেক্সট জেনারেশন ও স্থিতিশীল চ্যাট মডেল ফিল্টার করা
         available_ids = [
             m.id for m in models_data 
             if getattr(m, "active", True) and not any(blocked in m.id.lower() for blocked in blocked_keywords)
         ]
     except Exception as e:
-        raise RuntimeError(f"Groq API থেকে মডেল তালিকা লোড করতে ব্যর্থ: {str(e)}")
+        print(f"[WARN] মডেল তালিকা আনতে ব্যর্থ: {e}")
+        available_ids = []
 
     verified_models = []
-    print("[INFO] সচল ও নিরাপদ লিমিটের চ্যাট মডেল টেস্ট করা হচ্ছে...")
-
     test_messages = [
         {"role": "system", "content": "You are a test helper."},
         {"role": "user", "content": "hi"}
@@ -51,7 +46,6 @@ def discover_working_models(target_count: int = 5) -> List[str]:
 
     for model_id in available_ids:
         try:
-            # max_tokens নির্দিষ্ট করে দেওয়া হচ্ছে যাতে OTPM এরর না আসে
             res = client.chat.completions.create(
                 messages=test_messages,
                 model=model_id,
@@ -59,23 +53,30 @@ def discover_working_models(target_count: int = 5) -> List[str]:
             )
             if res and res.choices:
                 verified_models.append(model_id)
-                print(f"[ACTIVE CHAT MODEL] প্রস্তুত: {model_id}")
+                print(f"[MODEL READY] {model_id}")
                 if len(verified_models) == target_count:
                     break
-        except Exception as err:
-            print(f"[SKIPPED] {model_id} বাদ দেওয়া হয়েছে: {str(err)[:60]}...")
+        except Exception:
             continue
 
     if not verified_models:
-        # কোনো কারণে তালিকা খালি হলে ডিফল্ট দ্রুতগতির ও নির্ভরযোগ্য ব্যাকআপ
         verified_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
     while len(verified_models) < target_count:
         verified_models.append(verified_models[len(verified_models) % len(verified_models)])
 
     WORKING_MODELS = verified_models[:target_count]
-    print(f"[SUCCESS] ৫টি এজেন্টের জন্য নির্বাচিত মডেলসমূহ: {WORKING_MODELS}")
+    print(f"[FINAL MODELS LOCKED] {WORKING_MODELS}")
     return WORKING_MODELS
+
+# সার্ভার স্টার্ট হওয়ার সাথে সাথে ব্যাকগ্রাউন্ডে মডেল রেডি করা
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, discover_working_models)
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 class Message(BaseModel):
     role: str
@@ -89,7 +90,7 @@ class ChatPayload(BaseModel):
 def ping():
     return {
         "status": "alive", 
-        "assigned_models": WORKING_MODELS if len(WORKING_MODELS) == 5 else "Discovering on next run"
+        "assigned_models": WORKING_MODELS if len(WORKING_MODELS) == 5 else "Loading..."
     }
 
 async def run_agent(role_instruction: str, context: str, user_input: str, model_name: str) -> str:
@@ -106,20 +107,19 @@ async def run_agent(role_instruction: str, context: str, user_input: str, model_
                 model=model_name,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=600  # Groq Free Tier এর সীমার ভেতর রাখা হয়েছে
+                max_tokens=500
             )
             return response.choices[0].message.content
         except Exception as e:
-            # 429 রেট লিমিট বা টোকেন লিমিট এরর হলে নিরাপদ মডেল ব্যাকআপ হিসেবে কল হবে
             if "429" in str(e) or "limit" in str(e).lower():
-                print(f"[FALLBACK] {model_name}-এ লিমিট হয়েছে, llama-3.1-8b-instant দিয়ে পুনরায় চেষ্টা করা হচ্ছে...")
-                fallback_response = client.chat.completions.create(
+                # ফলব্যাক মডেল
+                fallback = client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=messages,
                     temperature=0.7,
-                    max_tokens=600
+                    max_tokens=500
                 )
-                return fallback_response.choices[0].message.content
+                return fallback.choices[0].message.content
             raise e
 
     return await loop.run_in_executor(None, call_groq)
@@ -129,39 +129,32 @@ async def chat_multi_agent(payload: ChatPayload):
     if not payload.prompt.strip():
         raise HTTPException(status_code=400, detail="প্রম্পট খালি রাখা যাবে না")
 
-    loop = asyncio.get_event_loop()
-    models = await loop.run_in_executor(None, discover_working_models)
-
+    models = discover_working_models()
     history_context = "\n".join([f"{m.role.upper()}: {m.content}" for m in payload.history[-4:]])
 
     try:
-        # এজেন্ট ১: Orchestrator
         a1_plan = await run_agent(
             "You are Agent 1 (Orchestrator). Break down the user problem into clear technical sub-goals concisely.",
             history_context, payload.prompt, models[0]
         )
 
-        # এজেন্ট ২: Architect & Builder
         a2_build = await run_agent(
             "You are Agent 2 (Builder/Coder). Generate the core structural logic or concise solution based on Agent 1's plan.",
             history_context, a1_plan, models[1]
         )
 
-        # এজেন্ট ৩: Critic & Security QA
         a3_critic = await run_agent(
-            "You are Agent 3 (Critic/QA). Spot bugs, edge cases, security issues, or flaws in Agent 2's output.",
+            "You are Agent 3 (Critic/QA). Spot bugs, edge cases, security issues, or flaws in Agent 2's output concisely.",
             history_context, a2_build, models[2]
         )
 
-        # এজেন্ট ৪: Optimizer & Refiner
         a4_refine = await run_agent(
             "You are Agent 4 (Optimizer). Fix issues spotted by Agent 3 and polish the deliverable.",
             history_context, f"Draft:\n{a2_build}\n\nCritique:\n{a3_critic}", models[3]
         )
 
-        # এজেন্ট ৫: Executive Presenter
         a5_final = await run_agent(
-            "You are Agent 5 (Presenter). Prepare the final response for the user. Deliver a crystal-clear, structured deliverable without meta-commentary.",
+            "You are Agent 5 (Presenter). Prepare the final response for the user. Deliver an impeccably organized, crystal-clear deliverable without meta-commentary.",
             history_context, a4_refine, models[4]
         )
 
@@ -273,7 +266,15 @@ def serve_ui():
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ prompt: prompt, history: chatHistory })
                     });
-                    const data = await res.json();
+                    
+                    const textData = await res.text();
+                    let data;
+                    try {
+                        data = JSON.parse(textData);
+                    } catch (err) {
+                        throw new Error("সার্ভার থেকে সঠিক রেসপন্স আসেনি (সম্ভবত টাইমআউট বা ইন্টারনাল এরর)");
+                    }
+
                     if (!res.ok) throw new Error(data.detail || "Execution failed");
 
                     chatHistory.push({ role: "user", content: prompt });
