@@ -1,360 +1,295 @@
 import os
 import asyncio
 from typing import List
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from groq import Groq
+import google.generativeai as genai
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-client = Groq(api_key=GROQ_API_KEY.strip()) if GROQ_API_KEY else None
+app = FastAPI()
 
-WORKING_MODELS: List[str] = []
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY.strip())
 
-def discover_working_models(target_count: int = 5) -> List[str]:
-    """Groq API থেকে মডেল সংগ্রহ ও যাচাই"""
-    global WORKING_MODELS
-    if len(WORKING_MODELS) >= target_count:
-        return WORKING_MODELS
+# গ্লোবাল ভেরিয়েবল যা সফল মডেলটি ধরে রাখবে
+WORKING_MODEL_NAME = None
 
-    if not client:
-        print("[ERROR] GROQ_API_KEY পাওয়া যায়নি!")
-        return ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+def find_working_free_model() -> str:
+    global WORKING_MODEL_NAME
+    if WORKING_MODEL_NAME:
+        return WORKING_MODEL_NAME
 
-    blocked_keywords = [
-        "whisper", "tts", "audio", "embed", "guard", 
-        "classifier", "moderation", "safeguard", "vision",
-        "qwen", "r1", "preview"
-    ]
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY পাওয়া যায়নি! Render Environment Variables চেক করুন।")
 
-    try:
-        models_data = client.models.list().data
-        available_ids = [
-            m.id for m in models_data 
-            if getattr(m, "active", True) and not any(blocked in m.id.lower() for blocked in blocked_keywords)
-        ]
-    except Exception as e:
-        print(f"[WARN] মডেল তালিকা আনতে ব্যর্থ: {e}")
-        available_ids = []
+    # generateContent সমর্থনকারী মডেলের তালিকা সংগ্রহ
+    try:
+        all_models = [
+            m.name for m in genai.list_models()
+            if 'generateContent' in m.supported_generation_methods
+        ]
+    except Exception as e:
+        raise RuntimeError(f"গুগল এপিআই তালিকা লোড করতে ব্যর্থ: {str(e)}")
 
-    verified_models = []
-    test_messages = [
-        {"role": "system", "content": "You are a test helper."},
-        {"role": "user", "content": "hi"}
-    ]
+    # বিলিং বা পেইড মডেলগুলো বাদ দেওয়া (omni, pro, ultra)
+    safe_candidates = [
+        m for m in all_models
+        if not any(blocked in m.lower() for blocked in ['omni', 'pro', 'ultra', 'preview-02'])
+    ]
 
-    for model_id in available_ids:
-        try:
-            res = client.chat.completions.create(
-                messages=test_messages,
-                model=model_id,
-                max_tokens=10
-            )
-            if res and res.choices:
-                verified_models.append(model_id)
-                print(f"[MODEL READY] {model_id}")
-                if len(verified_models) == target_count:
-                    break
-        except Exception:
-            continue
+    # ফ্রি ফ্ল্যাশ ও লাইট মডেলগুলোকে অগ্রাধিকার দেওয়া
+    priority_order = ['2.5-flash', '2.0-flash', 'flash-lite', '1.5-flash-8b', 'flash']
+    sorted_candidates = []
+    
+    for p in priority_order:
+        for m in safe_candidates:
+            if p in m.lower() and m not in sorted_candidates:
+                sorted_candidates.append(m)
 
-    if not verified_models:
-        verified_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+    # বাকি সব নিরাপদ মডেল যুক্ত করা
+    for m in safe_candidates:
+        if m not in sorted_candidates:
+            sorted_candidates.append(m)
 
-    while len(verified_models) < target_count:
-        verified_models.append(verified_models[len(verified_models) % len(verified_models)])
+    # একের পর এক টেস্ট করে ফ্রি কোটা সচল থাকা প্রথম মডেলটি লক করা
+    last_err = ""
+    for model_name in sorted_candidates:
+        try:
+            test_m = genai.GenerativeModel(model_name)
+            res = test_m.generate_content("hi")
+            if res and res.text:
+                WORKING_MODEL_NAME = model_name
+                print(f"[SUCCESS] Free active model locked: {WORKING_MODEL_NAME}")
+                return WORKING_MODEL_NAME
+        except Exception as err:
+            last_err = str(err)
+            continue
 
-    WORKING_MODELS = verified_models[:target_count]
-    print(f"[FINAL MODELS LOCKED] {WORKING_MODELS}")
-    return WORKING_MODELS
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, discover_working_models)
-    yield
-
-app = FastAPI(lifespan=lifespan)
+    raise RuntimeError(f"কোনো ফ্রি মডেল পাওয়া যায়নি। সর্বশেষ ত্রুটি: {last_err}")
 
 class Message(BaseModel):
-    role: str
-    content: str
+    role: str
+    content: str
 
 class ChatPayload(BaseModel):
-    prompt: str
-    history: List[Message] = []
+    prompt: str
+    history: List[Message] = []
 
 @app.get("/ping")
 def ping():
-    return {
-        "status": "alive", 
-        "assigned_models": WORKING_MODELS if len(WORKING_MODELS) == 5 else "Loading..."
-    }
+    return {"status": "alive", "active_model": WORKING_MODEL_NAME or "standby"}
 
-async def run_agent(role_instruction: str, context: str, user_input: str, model_name: str, max_tokens: int = 400) -> str:
-    loop = asyncio.get_event_loop()
-    
-    # কনটেক্সট অতিরিক্ত বড় হলে ট্রাঙ্কেট করে দেওয়া যাতে context_length_exceeded না আসে
-    safe_context = context[-1200:] if len(context) > 1200 else context
-    safe_input = user_input[-2500:] if len(user_input) > 2500 else user_input
+async def run_agent(role_instruction: str, context: str, user_input: str) -> str:
+    loop = asyncio.get_event_loop()
+    # সচল মডেল খুঁজে নেওয়া
+    active_model_name = await loop.run_in_executor(None, find_working_free_model)
+    model = genai.GenerativeModel(active_model_name)
 
-    messages = [
-        {"role": "system", "content": f"{role_instruction}\n\nCONTEXT:\n{safe_context}"},
-        {"role": "user", "content": safe_input}
-    ]
-
-    def call_groq():
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=max_tokens
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            # ফলব্যাক মডেল
-            if "429" in str(e) or "limit" in str(e).lower() or "context" in str(e).lower():
-                print(f"[FALLBACK] {model_name} ফেইল করেছে, llama-3.1-8b-instant ব্যবহার করা হচ্ছে...")
-                fallback = client.chat.completions.create(
-                    model="llama-3.1-8b-instant",
-                    messages=messages,
-                    temperature=0.7,
-                    max_tokens=max_tokens
-                )
-                return fallback.choices[0].message.content
-            raise e
-
-    return await loop.run_in_executor(None, call_groq)
+    prompt = f"SYSTEM ROLE: {role_instruction}\n\nCONVERSATION CONTEXT:\n{context}\n\nCURRENT TASK:\n{user_input}"
+    response = await loop.run_in_executor(None, model.generate_content, prompt)
+    return response.text
 
 @app.post("/api/chat")
 async def chat_multi_agent(payload: ChatPayload):
-    if not payload.prompt.strip():
-        raise HTTPException(status_code=400, detail="প্রম্পট খালি রাখা যাবে না")
+    if not payload.prompt.strip():
+        raise HTTPException(status_code=400, detail="প্রম্পট খালি রাখা যাবে না")
 
-    models = discover_working_models()
+    history_context = "\n".join([f"{m.role.upper()}: {m.content}" for m in payload.history[-6:]])
 
-    # পূর্ববর্তী হিস্ট্রি সংক্ষিপ্ত করে নেওয়া (শুধু শেষ ২টি টার্ন এবং সংকুচিত টেক্সট)
-    shortened_history = []
-    for m in payload.history[-2:]:
-        trimmed_content = (m.content[:250] + "...") if len(m.content) > 250 else m.content
-        shortened_history.append(f"{m.role.upper()}: {trimmed_content}")
-    history_context = "\n".join(shortened_history)
+    try:
+        # এজেন্ট ১: Orchestrator
+        a1_plan = await run_agent(
+            "You are Agent 1 (Orchestrator). Break down the user problem into clear technical sub-goals.",
+            history_context, payload.prompt
+        )
 
-    try:
-        # এজেন্ট ১: Orchestrator (সংক্ষিপ্ত সাব-গোলস)
-        a1_plan = await run_agent(
-            "You are Agent 1 (Orchestrator). Output ONLY 3-4 bullet points of high-level requirements. Very concise.",
-            history_context, payload.prompt, models[0], max_tokens=300
-        )
+        # এজেন্ট ২: Architect & Builder
+        a2_build = await run_agent(
+            "You are Agent 2 (Builder/Coder). Generate the core structural logic, implementation, or solution based on Agent 1's plan.",
+            history_context, a1_plan
+        )
 
-        # এজেন্ট ২: Architect & Builder (সংক্ষিপ্ত কোর লজিক)
-        a2_build = await run_agent(
-            "You are Agent 2 (Builder/Coder). Draft the essential code logic based on Agent 1. Avoid long comments.",
-            history_context, a1_plan, models[1], max_tokens=500
-        )
+        # এজেন্ট ৩: Critic & Security QA
+        a3_critic = await run_agent(
+            "You are Agent 3 (Critic/QA). Aggressively spot bugs, missing edge cases, security issues, or logical flaws in Agent 2's output.",
+            history_context, a2_build
+        )
 
-        # এজেন্ট ৩: Critic & Security QA (সংক্ষিপ্ত রিভিউ)
-        a3_critic = await run_agent(
-            "You are Agent 3 (Critic/QA). Identify top 2-3 syntax, logic, or edge case bugs. Be extremely concise.",
-            history_context, a2_build, models[2], max_tokens=300
-        )
+        # এজেন্ট ৪: Optimizer & Refiner
+        a4_refine = await run_agent(
+            "You are Agent 4 (Optimizer). Fix all issues found by Agent 3 and polish the implementation to production standard.",
+            history_context, f"Code:\n{a2_build}\n\nCritique:\n{a3_critic}"
+        )
 
-        # এজেন্ট ৪: Optimizer (সংশোধিত সারাংশ)
-        a4_refine = await run_agent(
-            "You are Agent 4 (Optimizer). Briefly list fixes to apply to Agent 2's code according to Agent 3.",
-            history_context, f"Code:\n{a2_build[:800]}\nCritique:\n{a3_critic}", models[3], max_tokens=400
-        )
+        # এজেন্ট ৫: Executive Presenter
+        a5_final = await run_agent(
+            "You are Agent 5 (Presenter). Prepare the final response for the user. Deliver an impeccably organized, crystal-clear deliverable. No robotic introductions.",
+            history_context, a4_refine
+        )
 
-        # এজেন্ট ৫: Executive Presenter (সম্পূর্ণ কার্যকর আউটপুট)
-        a5_final = await run_agent(
-            "You are Agent 5 (Presenter). Write the COMPLETE, runnable, working Python code. "
-            "Do NOT include ASCII diagrams. Do NOT cut off. Deliver the full solution.",
-            history_context, f"User Goal:\n{payload.prompt}\n\nDraft Plan:\n{a4_refine}\n\nBase Code:\n{a2_build}", 
-            models[4], max_tokens=1500
-        )
-
-        return {
-            "models_used": {
-                "agent_1": models[0],
-                "agent_2": models[1],
-                "agent_3": models[2],
-                "agent_4": models[3],
-                "agent_5": models[4],
-            },
-            "agent_1": a1_plan,
-            "agent_2": a2_build,
-            "agent_3": a3_critic,
-            "agent_4": a4_refine,
-            "final_output": a5_final
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "model_used": WORKING_MODEL_NAME,
+            "agent_1": a1_plan,
+            "agent_2": a2_build,
+            "agent_3": a3_critic,
+            "agent_4": a4_refine,
+            "final_output": a5_final
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/", response_class=HTMLResponse)
 def serve_ui():
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Autonomous 5-Agent Workspace</title>
-        <style>
-            :root {
-                --bg: #0d1117;
-                --panel: #161b22;
-                --border: #30363d;
-                --accent: #238636;
-                --text: #c9d1d9;
-                --highlight: #58a6ff;
-            }
-            * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-            body { background-color: var(--bg); color: var(--text); padding: 20px; display: flex; justify-content: center; }
-            .container { max-width: 950px; width: 100%; display: flex; flex-direction: column; gap: 20px; }
-            header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 15px; }
-            header h1 { font-size: 1.4rem; color: var(--highlight); }
-            .clear-btn { background: #21262d; border: 1px solid var(--border); color: #f85149; padding: 6px 12px; border-radius: 6px; cursor: pointer; }
-            
-            #chatLog { display: flex; flex-direction: column; gap: 20px; }
-            .turn { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 18px; }
-            .user-msg { font-size: 1rem; font-weight: 600; color: #f0f6fc; margin-bottom: 15px; border-left: 3px solid var(--highlight); padding-left: 10px; }
-            
-            .final-card { background: #0d1117; border: 1px solid #238636; border-radius: 8px; padding: 18px; margin-bottom: 15px; }
-            .final-title { font-size: 1rem; font-weight: 700; color: #7ee787; display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
-            .model-badge { font-size: 0.75rem; background: #21262d; padding: 2px 8px; border-radius: 10px; color: #8b949e; font-weight: normal; }
-            .output-text { white-space: pre-wrap; word-break: break-word; font-size: 0.95rem; line-height: 1.6; color: #f0f6fc; }
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Autonomous 5-Agent Workspace</title>
+        <style>
+            :root {
+                --bg: #0d1117;
+                --panel: #161b22;
+                --border: #30363d;
+                --accent: #238636;
+                --text: #c9d1d9;
+                --highlight: #58a6ff;
+            }
+            * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+            body { background-color: var(--bg); color: var(--text); padding: 20px; display: flex; justify-content: center; }
+            .container { max-width: 950px; width: 100%; display: flex; flex-direction: column; gap: 20px; }
+            header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 15px; }
+            header h1 { font-size: 1.4rem; color: var(--highlight); }
+            .clear-btn { background: #21262d; border: 1px solid var(--border); color: #f85149; padding: 6px 12px; border-radius: 6px; cursor: pointer; }
+            
+            #chatLog { display: flex; flex-direction: column; gap: 20px; }
+            .turn { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 18px; }
+            .user-msg { font-size: 1rem; font-weight: 600; color: #f0f6fc; margin-bottom: 15px; border-left: 3px solid var(--highlight); padding-left: 10px; }
+            
+            .final-card { background: #0d1117; border: 1px solid #238636; border-radius: 8px; padding: 18px; margin-bottom: 15px; }
+            .final-title { font-size: 1rem; font-weight: 700; color: #7ee787; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; }
+            .model-badge { font-size: 0.75rem; background: #21262d; padding: 2px 8px; border-radius: 10px; color: #8b949e; font-weight: normal; }
+            .output-text { white-space: pre-wrap; word-break: break-word; font-size: 0.95rem; line-height: 1.6; color: #f0f6fc; }
 
-            .agent-tray { display: flex; flex-direction: column; gap: 8px; }
-            details { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
-            summary { padding: 10px 14px; cursor: pointer; font-size: 0.85rem; font-weight: 600; color: #8b949e; user-select: none; }
-            summary:hover { background: #1f242c; color: #c9d1d9; }
-            .agent-content { padding: 12px; font-size: 0.85rem; white-space: pre-wrap; word-break: break-word; color: #8b949e; border-top: 1px solid var(--border); background: #090d12; font-family: monospace; }
-            
-            .input-box { position: sticky; bottom: 20px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
-            textarea { width: 100%; height: 75px; background: #0d1117; border: 1px solid var(--border); border-radius: 6px; color: #f0f6fc; padding: 10px; resize: none; font-size: 0.95rem; outline: none; }
-            textarea:focus { border-color: var(--highlight); }
-            button.submit { background: var(--accent); color: white; border: none; padding: 10px 20px; border-radius: 6px; font-weight: 600; cursor: pointer; align-self: flex-end; }
-            button.submit:disabled { opacity: 0.5; cursor: not-allowed; }
-            .status { font-size: 0.85rem; color: #8b949e; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <header>
-                <h1>Autonomous 5-Agent Workspace</h1>
-                <button class="clear-btn" onclick="clearMemory()">Clear Memory</button>
-            </header>
+            .agent-tray { display: flex; flex-direction: column; gap: 8px; }
+            details { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+            summary { padding: 10px 14px; cursor: pointer; font-size: 0.85rem; font-weight: 600; color: #8b949e; user-select: none; }
+            summary:hover { background: #1f242c; color: #c9d1d9; }
+            .agent-content { padding: 12px; font-size: 0.85rem; white-space: pre-wrap; word-break: break-word; color: #8b949e; border-top: 1px solid var(--border); background: #090d12; font-family: monospace; }
+            
+            .input-box { position: sticky; bottom: 20px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+            textarea { width: 100%; height: 75px; background: #0d1117; border: 1px solid var(--border); border-radius: 6px; color: #f0f6fc; padding: 10px; resize: none; font-size: 0.95rem; outline: none; }
+            textarea:focus { border-color: var(--highlight); }
+            button.submit { background: var(--accent); color: white; border: none; padding: 10px 20px; border-radius: 6px; font-weight: 600; cursor: pointer; align-self: flex-end; }
+            button.submit:disabled { opacity: 0.5; cursor: not-allowed; }
+            .status { font-size: 0.85rem; color: #8b949e; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <header>
+                <h1>Autonomous 5-Agent Workspace</h1>
+                <button class="clear-btn" onclick="clearMemory()">Clear Memory</button>
+            </header>
 
-            <div id="chatLog"></div>
+            <div id="chatLog"></div>
 
-            <div class="input-box">
-                <textarea id="promptInput" placeholder="আপনার নির্দেশ বা সমস্যা লিখুন..."></textarea>
-                <div style="display: flex; justify-content: space-between; align-items: center;">
-                    <span id="status" class="status">প্রস্তুত</span>
-                    <button id="submitBtn" class="submit" onclick="executePrompt()">Execute</button>
-                </div>
-            </div>
-        </div>
+            <div class="input-box">
+                <textarea id="promptInput" placeholder="আপনার নির্দেশ বা সমস্যা লিখুন..."></textarea>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span id="status" class="status">প্রস্তুত</span>
+                    <button id="submitBtn" class="submit" onclick="executePrompt()">Execute</button>
+                </div>
+            </div>
+        </div>
 
-        <script>
-            let chatHistory = JSON.parse(localStorage.getItem('agent_history') || '[]');
+        <script>
+            let chatHistory = JSON.parse(localStorage.getItem('agent_history') || '[]');
 
-            function clearMemory() {
-                chatHistory = [];
-                localStorage.removeItem('agent_history');
-                document.getElementById('chatLog').innerHTML = '';
-            }
+            function clearMemory() {
+                chatHistory = [];
+                localStorage.removeItem('agent_history');
+                document.getElementById('chatLog').innerHTML = '';
+            }
 
-            async function executePrompt() {
-                const input = document.getElementById('promptInput');
-                const prompt = input.value.trim();
-                if (!prompt) return;
+            async function executePrompt() {
+                const input = document.getElementById('promptInput');
+                const prompt = input.value.trim();
+                if (!prompt) return;
 
-                const submitBtn = document.getElementById('submitBtn');
-                const status = document.getElementById('status');
-                submitBtn.disabled = true;
-                status.innerText = "৫টি এজেন্ট ক্রমান্বয়ে সমাধান প্রস্তুত করছে...";
+                const submitBtn = document.getElementById('submitBtn');
+                const status = document.getElementById('status');
+                submitBtn.disabled = true;
+                status.innerText = "৫টি এজেন্ট ক্রমান্বয়ে সমাধান প্রস্তুত করছে...";
 
-                try {
-                    const res = await fetch('/api/chat', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ prompt: prompt, history: chatHistory })
-                    });
-                    
-                    const textData = await res.text();
-                    let data;
-                    try {
-                        data = JSON.parse(textData);
-                    } catch (err) {
-                        throw new Error("সার্ভার থেকে সঠিক রেসপন্স আসেনি (সম্ভবত টাইমআউট বা ইন্টারনাল এরর)");
-                    }
+                try {
+                    const res = await fetch('/api/chat', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ prompt: prompt, history: chatHistory })
+                    });
+                    const data = await res.json();
+                    if (!res.ok) throw new Error(data.detail || "Execution failed");
 
-                    if (!res.ok) throw new Error(data.detail || "Execution failed");
+                    chatHistory.push({ role: "user", content: prompt });
+                    chatHistory.push({ role: "assistant", content: data.final_output });
+                    localStorage.setItem('agent_history', JSON.stringify(chatHistory));
 
-                    // মেমোরি হালকা রাখতে লোকালস্টোরেজে সংক্ষিপ্ত হিস্ট্রি রাখা
-                    chatHistory.push({ role: "user", content: prompt });
-                    chatHistory.push({ role: "assistant", content: data.final_output.slice(0, 300) });
-                    if (chatHistory.length > 6) chatHistory = chatHistory.slice(-6);
-                    localStorage.setItem('agent_history', JSON.stringify(chatHistory));
+                    renderTurn(prompt, data);
+                    input.value = '';
+                    status.innerText = "সম্পন্ন";
+                } catch (e) {
+                    status.innerText = "ত্রুটি: " + e.message;
+                } finally {
+                    submitBtn.disabled = false;
+                }
+            }
 
-                    renderTurn(prompt, data);
-                    input.value = '';
-                    status.innerText = "সম্পন্ন";
-                } catch (e) {
-                    status.innerText = "ত্রুটি: " + e.message;
-                } finally {
-                    submitBtn.disabled = false;
-                }
-            }
+            function renderTurn(prompt, data) {
+                const log = document.getElementById('chatLog');
+                const turnDiv = document.createElement('div');
+                turnDiv.className = 'turn';
 
-            function renderTurn(prompt, data) {
-                const log = document.getElementById('chatLog');
-                const turnDiv = document.createElement('div');
-                turnDiv.className = 'turn';
+                turnDiv.innerHTML = `
+                    <div class="user-msg">${escapeHtml(prompt)}</div>
+                    
+                    <div class="final-card">
+                        <div class="final-title">
+                            <span>✓ Agent 5: Verified & Structured Output</span>
+                            <span class="model-badge">${escapeHtml(data.model_used || 'Active')}</span>
+                        </div>
+                        <div class="output-text">${escapeHtml(data.final_output)}</div>
+                    </div>
 
-                const m = data.models_used || {};
+                    <div class="agent-tray">
+                        <details>
+                            <summary>Agent 1: Orchestrator (Strategy & Breakdown)</summary>
+                            <div class="agent-content">${escapeHtml(data.agent_1)}</div>
+                        </details>
+                        <details>
+                            <summary>Agent 2: Builder (Structural Draft)</summary>
+                            <div class="agent-content">${escapeHtml(data.agent_2)}</div>
+                        </details>
+                        <details>
+                            <summary>Agent 3: Critic (QA & Security Scan)</summary>
+                            <div class="agent-content">${escapeHtml(data.agent_3)}</div>
+                        </details>
+                        <details>
+                            <summary>Agent 4: Optimizer (Refined Deliverable)</summary>
+                            <div class="agent-content">${escapeHtml(data.agent_4)}</div>
+                        </details>
+                    </div>
+                `;
+                log.appendChild(turnDiv);
+                window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+            }
 
-                turnDiv.innerHTML = `
-                    <div class="user-msg">${escapeHtml(prompt)}</div>
-                    
-                    <div class="final-card">
-                        <div class="final-title">
-                            <span>✓ Agent 5: Verified & Structured Output</span>
-                            <span class="model-badge">${escapeHtml(m.agent_5 || 'Active')}</span>
-                        </div>
-                        <div class="output-text">${escapeHtml(data.final_output)}</div>
-                    </div>
-
-                    <div class="agent-tray">
-                        <details>
-                            <summary>Agent 1: Orchestrator [${escapeHtml(m.agent_1 || '')}]</summary>
-                            <div class="agent-content">${escapeHtml(data.agent_1)}</div>
-                        </details>
-                        <details>
-                            <summary>Agent 2: Builder [${escapeHtml(m.agent_2 || '')}]</summary>
-                            <div class="agent-content">${escapeHtml(data.agent_2)}</div>
-                        </details>
-                        <details>
-                            <summary>Agent 3: Critic [${escapeHtml(m.agent_3 || '')}]</summary>
-                            <div class="agent-content">${escapeHtml(data.agent_3)}</div>
-                        </details>
-                        <details>
-                            <summary>Agent 4: Optimizer [${escapeHtml(m.agent_4 || '')}]</summary>
-                            <div class="agent-content">${escapeHtml(data.agent_4)}</div>
-                        </details>
-                    </div>
-                `;
-                log.appendChild(turnDiv);
-                window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
-            }
-
-            function escapeHtml(text) {
-                return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-            }
-        </script>
-    </body>
-    </html>
-    """
+            function escapeHtml(text) {
+                return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            }
+        </script>
+    </body>
+    </html>
+    """
